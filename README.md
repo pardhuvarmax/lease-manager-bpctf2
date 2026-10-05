@@ -12,42 +12,19 @@ Instead of requiring organizers to manually allocate infrastructure to teams, pl
 
 The system was designed to operate during a live event where provisioning requests could arrive concurrently and where infrastructure availability and abuse prevention were important operational concerns.
 
+
 ## Architecture
 
-```text
-                        ┌─────────────────────┐
-                        │      Players        │
-                        └──────────┬──────────┘
-                                   │
-                                   │ HTTPS
-                                   ▼
-                        ┌─────────────────────┐
-                        │       Nginx         │
-                        │  TLS + Reverse Proxy│
-                        └──────────┬──────────┘
-                                   │
-                                   │ /api/*
-                                   ▼
-                        ┌─────────────────────┐
-                        │      leased.py      │
-                        │   Lease HTTP API    │
-                        └──────────┬──────────┘
-                                   │
-                         ┌─────────┴─────────┐
-                         │                   │
-                         ▼                   ▼
-                  ┌─────────────┐     ┌─────────────┐
-                  │    icctl    │     │    lsctl    │
-                  │ Iron Cold   │     │ LightSpeed  │
-                  └──────┬──────┘     └──────┬──────┘
-                         │                   │
-                         └─────────┬─────────┘
-                                   ▼
-                        ┌─────────────────────┐
-                        │ Challenge           │
-                        │ Infrastructure      │
-                        │ Docker / Instances   │
-                        └─────────────────────┘
+```mermaid
+flowchart TD
+    A[Players] -->|HTTPS| B[Nginx<br/>TLS + Reverse Proxy]
+    B -->|/api/*| C[leased.py<br/>Lease HTTP API]
+
+    C --> D[icctl<br/>Iron Cold]
+    C --> E[lsctl<br/>LightSpeed]
+
+    D --> F[Challenge Infrastructure<br/>Docker / Instances]
+    E --> F
 ```
 
 ## Components
