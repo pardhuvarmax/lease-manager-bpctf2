@@ -1,0 +1,294 @@
+# Lease Manager — BPCTF2
+
+Self-service cloud provisioning and lease management system built for **Breach Point CTF 2026 — Season 2 (BPCTF2)**.
+
+The system allows CTF teams to provision their own isolated challenge instances without requiring an organizer to manually execute provisioning commands and distribute connection details.
+
+## Overview
+
+During BPCTF2, challenge instances for **Iron Cold** and **LightSpeed** were provisioned dynamically from a finite instance pool.
+
+Previously, the workflow required an organizer to manually run:
+
+```bash
+icctl lease "Team Name"
+```
+
+or:
+
+```bash
+lsctl lease "Team Name"
+```
+
+and then send the resulting connection information to the team.
+
+**Lease Manager** replaces that manual step with a self-service HTTP interface.
+
+```text
+Team
+ │
+ ▼
+Lease Web Interface
+ │
+ ▼
+nginx / HTTPS
+ │
+ ▼
+leased.py
+ │
+ ├── Team validation
+ ├── Rate limiting
+ ├── Idempotent lease lookup
+ └── Provisioning request
+        │
+        ▼
+   icctl / lsctl
+        │
+        ▼
+ Docker Compose
+        │
+        ▼
+Challenge Instance
+```
+
+The same backend supports both BPCTF2 challenge environments through configuration.
+
+## Components
+
+### `lease-selfserve`
+
+Self-service provisioning layer.
+
+- `leased.py` — stdlib-only Python HTTP backend
+- `lease.html` — Iron Cold frontend
+- `lease-lightspeed.html` — LightSpeed frontend
+- `leased.service.template.txt` — systemd service template
+- `DEPLOY.md` — deployment and operational documentation
+
+The backend listens only on:
+
+```text
+127.0.0.1:8088
+```
+
+and is exposed externally through nginx.
+
+### `lease-for-ironcold`
+
+Iron Cold provisioning tooling and deployment configuration.
+
+### `lease-for-lightspeed`
+
+LightSpeed provisioning tooling and deployment configuration.
+
+## API
+
+### Create or retrieve a lease
+
+```http
+POST /api/lease
+Content-Type: application/json
+```
+
+Request:
+
+```json
+{
+  "team": "Example Team"
+}
+```
+
+Possible successful responses include:
+
+```json
+{
+  "status": "created",
+  "address": "..."
+}
+```
+
+or:
+
+```json
+{
+  "status": "existing",
+  "address": "..."
+}
+```
+
+For LightSpeed, the response may additionally contain the provisioned service token.
+
+### Health check
+
+```http
+GET /api/health
+```
+
+Example:
+
+```json
+{
+  "status": "ok",
+  "mode": "lightspeed"
+}
+```
+
+## Lease Semantics
+
+Lease creation is intentionally **idempotent**.
+
+Before attempting to provision a new instance, the backend checks whether the requested team already has an active lease:
+
+```text
+show <team>
+   │
+   ├── existing → return existing lease
+   │
+   └── absent → create new lease
+```
+
+This is important because provisioning a new instance can take approximately **10–25 seconds** due to cold Docker Compose startup.
+
+If a client times out while provisioning is still completing, submitting the same team name again resolves to the existing lease rather than creating another instance.
+
+## Abuse Controls
+
+Because BPCTF2 was already live when this system was introduced, pre-issued per-team authentication codes were not practical.
+
+The deployment therefore used bounded, name-based access with explicit abuse controls.
+
+### Per-IP distinct-team limit
+
+A source IP can claim at most:
+
+```text
+5 distinct team names / hour
+```
+
+This limits how quickly a single source can consume the finite instance pool with fabricated team names.
+
+### Request rate limit
+
+A source IP is additionally limited to:
+
+```text
+12 requests / minute
+```
+
+Repeated requests for an already-known team do not consume the distinct-team allocation limit.
+
+## Known Security Limitation
+
+The BPCTF2 deployment does **not provide identity verification**.
+
+A user who knows or guesses another team's name could theoretically request that team's lease.
+
+This was an accepted event-time tradeoff because the system was introduced after the competition had already started.
+
+The per-IP distinct-team limit bounds the amount of infrastructure that can be consumed by a single source.
+
+For the BPCTF2 deployment, abused instances could additionally be quarantined through the existing `icctl` / `lsctl` operational tooling.
+
+## Deployment
+
+The production deployment uses:
+
+- GCP Compute Engine
+- Docker / Docker Compose
+- Python
+- nginx
+- systemd
+- HTTPS
+- IAP-only SSH access
+
+The backend is intentionally not exposed directly to the network.
+
+```text
+Internet
+   │
+ HTTPS
+   ▼
+ nginx
+   │
+   │ reverse proxy
+   ▼
+127.0.0.1:8088
+   │
+   ▼
+leased.py
+```
+
+The systemd service runs the backend and restarts it automatically on failure.
+
+See [`DEPLOY.md`](./lease-selfserve/DEPLOY.md) for the BPCTF2 deployment procedure and operational notes.
+
+## Operational Behavior
+
+Provisioning failures are translated into explicit API responses where possible.
+
+Examples include:
+
+- Existing lease
+- Provisioning already in progress
+- Instance pool exhaustion
+- Provisioning failure
+- Successful provisioning with unparseable output
+
+The provisioning commands are executed with a bounded subprocess timeout, and the backend parses the resulting control-plane output into a stable API response.
+
+## Why It Was Built
+
+The system was developed to remove an operational bottleneck during a live CTF event.
+
+Instead of:
+
+```text
+Team → Organizer → CLI → Provision → Organizer → Team
+```
+
+the workflow became:
+
+```text
+Team → Lease Manager → Provision → Team
+```
+
+This reduced manual intervention while preserving the existing `icctl` and `lsctl` provisioning systems underneath.
+
+## BPCTF2 Context
+
+Lease Manager was deployed for the **Iron Cold** and **LightSpeed** challenge environments during BPCTF2.
+
+The system was designed for a live event environment with a finite pool of isolated challenge resources and concurrent participant requests.
+
+It is intentionally preserved in this repository as the **BPCTF2 production implementation**.
+
+The architecture and assumptions here are specific to that deployment. A future generalized version will separate the provisioning control plane from the BPCTF-specific `icctl` / `lsctl` tooling and introduce persistent state, authentication, resource providers, quotas, lifecycle reconciliation, and additional infrastructure backends.
+
+## Repository Structure
+
+```text
+.
+├── lease-for-ironcold/
+│   ├── icctl
+│   ├── docker-compose.yml
+│   └── install.sh
+│
+├── lease-for-lightspeed/
+│   ├── lsctl
+│   ├── docker-compose.datastores.yml
+│   ├── docker-compose.images.yml
+│   └── install.sh
+│
+└── lease-selfserve/
+    ├── leased.py
+    ├── lease.html
+    ├── lease-lightspeed.html
+    ├── leased.service.template.txt
+    └── DEPLOY.md
+```
+
+## Status
+
+**Production deployment for BPCTF2.**
+
+This repository represents the event-specific implementation.
