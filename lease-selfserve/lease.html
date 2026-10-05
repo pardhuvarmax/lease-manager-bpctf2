@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Request your instance</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: ui-monospace, Menlo, Consolas, monospace; background:#0d0f0b; color:#d6e0c4; max-width:560px; margin:40px auto; padding:0 16px; }
+  h1 { font-size:26px; font-weight:600; letter-spacing:.3px; margin-bottom:4px; }
+  p.sub { color:#8c9582; font-size:13px; line-height:1.6; }
+  input { width:100%; box-sizing:border-box; background:#181c16; border:1px solid #4b543d; color:#e1ecd0; padding:10px 12px; font:inherit; font-size:14px; }
+  button { margin-top:10px; width:100%; padding:11px; background:#bdcba0; color:#1a2013; border:0; font:inherit; font-weight:600; font-size:14px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  button:hover:not(:disabled) { background:#d3dfba; }
+  .result { margin-top:20px; border:1px solid #4b543d; background:#141911; padding:16px; display:none; }
+  .result.show { display:block; }
+  .result.err { border-color:#8c764b; background:#26251c; color:#c8ad75; }
+  .row { display:flex; justify-content:space-between; gap:12px; padding:7px 0; border-bottom:1px solid #2a3022; font-size:13px; }
+  .row:last-child { border-bottom:0; }
+  .row b { color:#eef3e2; word-break:break-all; text-align:right; }
+  .note { margin-top:12px; font-size:11px; color:#7b8570; line-height:1.6; }
+</style>
+</head>
+<body data-mode="__MODE__">
+  <h1 id="title">Request your instance</h1>
+  <p class="sub" id="sub"></p>
+  <input id="team" maxlength="48" placeholder="Your team name" autocomplete="off">
+  <button id="go">Request</button>
+  <div class="result" id="result"></div>
+  <p class="note">Re-submitting your own team name is always safe — you'll get your
+  existing instance back, not a new one. One instance per team.</p>
+
+<script>
+const MODE = document.body.dataset.mode || "lightspeed";
+const labels = {
+  lightspeed: { sub: "Enter your team name to get a gRPC address and auth token.", addr: "gRPC address", tok: "Token" },
+  ironcold:   { sub: "Enter your team name to get your instance's address.", addr: "Target", tok: null }
+};
+document.getElementById("sub").textContent = labels[MODE].sub;
+
+const go = document.getElementById("go");
+const input = document.getElementById("team");
+const result = document.getElementById("result");
+
+async function submit() {
+  const team = input.value.trim();
+  if (!team) return;
+  go.disabled = true;
+  result.className = "result show";
+  result.textContent = "requesting...";
+  try {
+    const resp = await fetch("/api/lease", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ team })
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      result.className = "result show err";
+      result.textContent = data.error || "something went wrong";
+      return;
+    }
+    result.className = "result show";
+    let html = `<div class="row"><span>${labels[MODE].addr}</span><b>${data.address}</b></div>`;
+    if (labels[MODE].tok && data.token) {
+      html += `<div class="row"><span>${labels[MODE].tok}</span><b>${data.token}</b></div>`;
+    }
+    html += `<div class="row"><span>status</span><b>${data.status === "existing" ? "your existing instance" : "newly created"}</b></div>`;
+    result.innerHTML = html;
+  } catch (e) {
+    result.className = "result show err";
+    result.textContent = "network error -- try again";
+  } finally {
+    go.disabled = false;
+  }
+}
+
+go.addEventListener("click", submit);
+input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+</script>
+</body>
+</html>

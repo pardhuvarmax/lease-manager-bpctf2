@@ -1,0 +1,18 @@
+# Pins one shared, pre-built image per service so every lease slot starts from the
+# same images (no per-slot Go build). Build once with install.sh, then every slot is
+# `docker compose ... up -d --no-build`. gateway-a/b/c share one image.
+services:
+  ledger:
+    image: lightspeed/ledger:release
+  gateway-a:
+    image: lightspeed/gateway:release
+  gateway-b:
+    image: lightspeed/gateway:release
+  gateway-c:
+    image: lightspeed/gateway:release
+  frontdoor:
+    image: lightspeed/frontdoor:release
+  webhook-consumer:
+    image: lightspeed/webhook-consumer:release
+  webhook-broker:
+    image: lightspeed/webhook-broker:release

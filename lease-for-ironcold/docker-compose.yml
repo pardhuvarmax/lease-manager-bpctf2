@@ -1,0 +1,16 @@
+# Deploy-time compose for Iron-Cold's lease pool. No fixed host port here on
+# purpose: icctl publishes each slot's own port via its generated override.yml
+# (`ports: !override`, Compose >=2.24). This file is copied to
+# /opt/ironcold/stack/docker-compose.yml by install.sh / the bundling step in
+# gcpdeploy.md - it is NOT the same file as challenge/docker-compose.yml (the
+# organizer's dev loop, which hardcodes 7770:7770) or submission/server/docker-compose.yml
+# (the single-shared-instance version shipped in the deploy.zip for a non-lease setup).
+services:
+  ic7:
+    build: .
+    image: ironcold/ic7:latest   # fixed tag: install.sh builds this ONCE; every per-slot
+                                  # compose project (icNN) must reference the SAME image, not
+                                  # one named after its own (per-slot) project.
+    restart: on-failure
+    mem_limit: 512m
+    cpus: 1.0

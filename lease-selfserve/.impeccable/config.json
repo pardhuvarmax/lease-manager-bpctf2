@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "overused-font",
+        "value": "space grotesk",
+        "files": [
+          "lease-selfserve/lease-lightspeed.html"
+        ],
+        "createdAt": "2026-10-03T09:11:12.600Z",
+        "reason": "matches the already-live LightSpeed landing page's established brand font (services/frontdoor/src/public/index.html), not a fresh choice"
+      }
+    ]
+  }
+}

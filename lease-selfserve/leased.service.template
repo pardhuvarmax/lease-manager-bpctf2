@@ -1,0 +1,16 @@
+[Unit]
+Description=Self-serve lease request backend (__MODE__)
+After=network.target
+
+[Service]
+Environment=LEASED_CTL=__CTL__
+Environment=LEASED_MODE=__MODE__
+Environment=LEASED_PORT=8088
+Environment=LEASED_SUDO=0
+ExecStart=/usr/bin/python3 /opt/leased/leased.py
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+# Fixes docker-compose.prod.yml's datastore hardening. That overlay applies
+# `cap_drop: [ALL]` to ledger-db (postgres) and redis, but both official images start
+# as root and need a few capabilities to prepare their data dir and then drop to their
+# own user (postgres / redis). Verified on a GCE VM:
+#   postgres:16-alpine  cap_drop ALL                  -> "chmod: ... Operation not permitted"  (unhealthy)
+#   postgres:16-alpine  + CHOWN SETUID SETGID DAC_OVERRIDE FOWNER -> healthy
+#   redis:7-alpine      cap_drop ALL                  -> "setpriv: setresuid failed"           (exits)
+#   redis:7-alpine      + CHOWN SETUID SETGID         -> PONG
+# Only the minimum is added back; no-new-privileges and the memory/PID limits still apply.
+# cap_add merges as a list with the base files.
+services:
+  ledger-db:
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]
+  redis:
+    cap_add: [CHOWN, SETUID, SETGID]

@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""icctl - Iron-Cold lease manager (organizer-only).
+
+Iron-Cold is one-QEMU-instance-per-session: pfcd's vault key is drawn fresh
+(getrandom()) the first time each instance boots and persists across pfcd
+crash/respawn (the RCE path crashes it on purpose during ASLR brute force),
+only changing on a genuine cold restart of that instance. With hundreds of
+teams we run a shared pool of isolated compose stacks ("slots") and lease
+one to each active team for a limited time. When a lease ends the stack is
+destroyed (`down -v`), so the slot returns fresh (and will draw a new vault
+key) to the pool. One lease per team by default: a second lease would give
+the team a fresh instance and a different flag 3.
+
+Flag 3 is static per instance (not per-attempt like LightSpeed's claims):
+it is read off the container's boot log once, right after the instance
+comes up, and stored in state so `verify`/`export` work without touching a
+possibly-restarted container later. Flags 1 and 2 are fixed strings shared
+by every instance and are not tracked here (see submission/README.md).
+
+Slots 1..ACTIVE are the normal pool; the remaining slots are spares, used
+only with --use-spare or when you quarantine an active slot (`icctl bad N`).
+
+State lives in $IC_STATE_DIR/state.json (atomic writes). Python 3 stdlib
+only.
+
+  icctl init [--slots 50] [--active 40] [--base-port 7001] [--hours 4] [--host H]
+  icctl lease TEAM [--hours H] [--use-spare] [--again]
+  icctl show TEAM                 reprint address
+  icctl status                    slots table
+  icctl release TEAM|--slot N     tear down now (records flag 3 in history)
+  icctl reap                      release expired leases (run by the systemd timer)
+  icctl extend TEAM --hours H
+  icctl verify TEAM FLAG          is FLAG this team's actual (live or past) flag 3?
+  icctl export                    CSV of active leases
+  icctl bad N | unbad N           quarantine / restore a slot
+  icctl stats                     per-slot memory (docker stats)
+IC_DRY=1 skips docker (for tests).
+"""
+import argparse
+import csv
+import fcntl
+import hashlib
+import hmac
+import io
+import os
+import json
+import re
+import socket
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+
+STACK_DIR = os.environ.get("IC_STACK_DIR", "/opt/ironcold/stack")
+STATE_DIR = os.environ.get("IC_STATE_DIR", "/var/lib/ironcold")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+SLOTS_DIR = os.path.join(STATE_DIR, "slots")
+DRY = os.environ.get("IC_DRY") == "1"
+TEAM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,63}$")
+VAULT_HMAC_CONTEXT = b"IC7-VAULT-RECORD-v1"  # must match VAULT_HMAC_CONTEXT in pfcd.c
+KEY_LINE_RE = re.compile(r"ic7vaultlog:([0-9a-fA-F]{32})")
+FLAG_RE = re.compile(r"^BREACH\{[0-9a-f]{64}\}$")
+
+
+# ----------------------------------------------------------------- helpers
+def now():
+    return datetime.now(timezone.utc)
+
+
+def iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse(s):
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def die(msg, code=1):
+    print("error: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+@contextmanager
+def locked():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, ".lock"), "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def load():
+    if not os.path.exists(STATE_FILE):
+        die("not initialised: run `icctl init` first")
+    with open(STATE_FILE) as f:
+        return json.load(f)
+
+
+def save(state):
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)
+
+
+def slot_key(n):
+    return "%02d" % n
+
+
+def slot_dir(n):
+    return os.path.join(SLOTS_DIR, slot_key(n))
+
+
+def project(n):
+    return "ic" + slot_key(n)
+
+
+def run(cmd, check=True, capture=False, timeout=None):
+    if DRY:
+        print("  [dry] " + " ".join(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    return subprocess.run(cmd, check=check, text=True, timeout=timeout,
+                          stdout=subprocess.PIPE if capture else None,
+                          stderr=subprocess.PIPE if capture else None)
+
+
+def compose(n, *args, **kw):
+    d = slot_dir(n)
+    cmd = ["docker", "compose", "-p", project(n), "--project-directory", STACK_DIR,
+           "-f", os.path.join(STACK_DIR, "docker-compose.yml"),
+           "-f", os.path.join(d, "override.yml")] + list(args)
+    return run(cmd, **kw)
+
+
+def compute_flag(vault_key_hex):
+    key = bytes.fromhex(vault_key_hex)
+    record = hmac.new(key, VAULT_HMAC_CONTEXT, hashlib.sha256).digest()
+    return "BREACH{%s}" % record.hex()
+
+
+def find_team(state, team):
+    for k, s in state["slots"].items():
+        if s.get("team") == team and s["status"] in ("leased", "starting", "releasing"):
+            return k, s
+    return None, None
+
+
+def handout(cfg, team, entry):
+    return "\n".join([
+        "=== Iron-Cold instance ===",
+        "Team    : %s" % team,
+        "Target  : %s:%d   (pfcd, raw TCP)" % (cfg["host"], entry["port"]),
+        "Leased  : %s" % entry["leased_at"],
+        "Expires : %s UTC" % entry["expires_at"],
+    ])
+
+
+# --------------------------------------------------------------------- init
+def cmd_init(a):
+    with locked():
+        if os.path.exists(STATE_FILE) and not a.force:
+            die("already initialised (use --force to wipe state.json; running stacks are NOT touched)")
+        if a.active > a.slots:
+            die("--active cannot exceed --slots")
+        state = {"config": {"slots": a.slots, "active": a.active, "base_port": a.base_port,
+                            "hours": a.hours, "host": a.host},
+                 "slots": {}, "history": []}
+        for i in range(1, a.slots + 1):
+            state["slots"][slot_key(i)] = {"status": "free", "port": a.base_port + i - 1,
+                                           "spare": i > a.active}
+        os.makedirs(SLOTS_DIR, exist_ok=True)
+        save(state)
+    print("initialised: %d slots (%d active + %d spare), ports %d-%d, default lease %sh"
+          % (a.slots, a.active, a.slots - a.active, a.base_port, a.base_port + a.slots - 1, a.hours))
+
+
+# -------------------------------------------------------------------- lease
+def write_slot_files(n, port):
+    d = slot_dir(n)
+    os.makedirs(d, exist_ok=True)
+    os.chmod(d, 0o700)
+    with open(os.path.join(d, "override.yml"), "w") as f:
+        f.write("# generated by icctl; publishes this slot's pfcd port on all interfaces.\n"
+                "services:\n  ic7:\n    ports: !override\n      - \"%d:7770\"\n" % port)
+
+
+def wait_port(port, timeout=180):
+    if DRY:
+        return True
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=2):
+                return True
+        except OSError:
+            time.sleep(2)
+    return False
+
+
+def read_vault_key(n, timeout=60):
+    """Poll `docker logs` for the once-per-boot ic7vaultlog line (see
+    overlay/etc/pfc/print_vault_key.sh). Not reachable by players; see
+    submission/README.md's "Infra flag retrieval" note."""
+    if DRY:
+        return "0" * 32
+    end = time.time() + timeout
+    container = "%s-ic7-1" % project(n)
+    last = None
+    while time.time() < end:
+        r = subprocess.run(["docker", "logs", container], text=True, capture_output=True)
+        matches = KEY_LINE_RE.findall((r.stdout or "") + (r.stderr or ""))
+        if matches:
+            last = matches[-1]
+            break
+        time.sleep(2)
+    return last
+
+
+def teardown(n):
+    try:
+        compose(n, "down", "-v", "--remove-orphans", check=False, timeout=180)
+    except Exception as e:  # noqa: BLE001 - keep going, caller marks state
+        print("  warning: teardown of %s raised %s" % (project(n), e), file=sys.stderr)
+    try:
+        os.remove(os.path.join(slot_dir(n), "override.yml"))
+    except FileNotFoundError:
+        pass
+
+
+def cmd_lease(a):
+    team = a.team.strip()
+    if not TEAM_RE.match(team):
+        die("team name must be 1-64 chars: letters, digits, space, _ . -")
+    with locked():
+        state = load()
+        k, s = find_team(state, team)
+        if k:
+            if s["status"] == "leased":
+                print("(team already has an active lease)\n")
+                print(handout(state["config"], team, s))
+                return
+            die("team %s is mid-operation on slot %s (%s); retry shortly" % (team, k, s["status"]))
+        if not a.again and any(h["team"] == team for h in state["history"]):
+            die("team %s already had a lease (one per team). Use --again to override on purpose; "
+                "a new lease is a fresh instance with a different flag 3." % team)
+        cfg = state["config"]
+        in_use = sum(1 for x in state["slots"].values() if x["status"] in ("leased", "starting"))
+        free = [kk for kk, x in sorted(state["slots"].items()) if x["status"] == "free"]
+        pick = [kk for kk in free if not state["slots"][kk]["spare"]]
+        if not pick and a.use_spare:
+            pick = [kk for kk in free if state["slots"][kk]["spare"]]
+        if not pick:
+            die("no free slot (%d in use of %d active%s). Release one, or use --use-spare."
+                % (in_use, cfg["active"], "; spares exist" if any(state["slots"][kk]["spare"] for kk in free) else ""))
+        key = pick[0]
+        n = int(key)
+        hours = a.hours if a.hours is not None else cfg["hours"]
+        t0 = now()
+        entry = state["slots"][key]
+        entry.update({"status": "starting", "team": team, "leased_at": iso(t0),
+                      "expires_at": iso(t0 + timedelta(hours=hours))})
+        save(state)
+    # --- slow part, outside the lock
+    ok, vault_key, flag3 = False, None, None
+    try:
+        write_slot_files(n, entry["port"])
+        compose(n, "up", "-d", "--no-build")
+        if wait_port(entry["port"]):
+            vault_key = read_vault_key(n)
+            if vault_key:
+                flag3 = compute_flag(vault_key)
+                ok = True
+    except Exception as e:  # noqa: BLE001
+        print("  lease failed: %s" % e, file=sys.stderr)
+    with locked():
+        state = load()
+        entry = state["slots"][key]
+        if not ok:
+            teardown(n)
+            entry.update({"status": "bad", "note": "failed to start for team %s at %s" % (team, iso(now()))})
+            for f in ("team", "leased_at", "expires_at"):
+                entry.pop(f, None)
+            save(state)
+            die("slot %s failed to start (or never printed its vault key); quarantined as bad. "
+                "Try again (another slot is used)." % key)
+        entry["status"] = "leased"
+        entry["vault_key"] = vault_key
+        entry["flag3"] = flag3
+        save(state)
+        print(handout(state["config"], team, entry))
+
+
+# ------------------------------------------------------------------ release
+def release_slot(key, reason):
+    n = int(key)
+    with locked():
+        state = load()
+        s = state["slots"][key]
+        if s["status"] not in ("leased", "bad"):
+            return False
+        team = s.get("team")
+        was_leased = s["status"] == "leased"
+        s["status"] = "releasing"
+        save(state)
+    # Re-read the vault key now, in case of a cold restart since lease time
+    # (crash/respawn mid-competition does not change it - see module docstring).
+    current_key = read_vault_key(n, timeout=10) if was_leased else None
+    teardown(n)
+    with locked():
+        state = load()
+        s = state["slots"][key]
+        if was_leased:
+            key_now = current_key or s.get("vault_key")
+            flag_now = compute_flag(key_now) if key_now else s.get("flag3")
+            state["history"].append({"team": team, "slot": key, "port": s["port"],
+                                     "leased_at": s.get("leased_at"), "released_at": iso(now()),
+                                     "reason": reason, "vault_key": key_now, "flag3": flag_now})
+        for f in ("team", "leased_at", "expires_at", "note", "vault_key", "flag3"):
+            s.pop(f, None)
+        s["status"] = "free"
+        save(state)
+    print("released slot %s (%s)" % (key, reason))
+    return True
+
+
+def cmd_release(a):
+    state = load()
+    if a.slot is not None:
+        key = slot_key(a.slot)
+    elif a.team:
+        key, _ = find_team(state, a.team.strip())
+        if not key:
+            die("no active lease for team %r" % a.team)
+    else:
+        die("give TEAM or --slot N")
+    if not release_slot(key, "manual"):
+        die("slot %s is not leased" % key)
+
+
+def cmd_reap(a):
+    state = load()
+    t = now()
+    due = [k for k, s in sorted(state["slots"].items())
+           if s["status"] == "leased" and parse(s["expires_at"]) <= t]
+    for k in due:
+        release_slot(k, "expired")
+    if not due and not a.quiet:
+        print("nothing expired")
+
+
+def cmd_extend(a):
+    with locked():
+        state = load()
+        k, s = find_team(state, a.team.strip())
+        if not k or s["status"] != "leased":
+            die("no active lease for %r" % a.team)
+        s["expires_at"] = iso(parse(s["expires_at"]) + timedelta(hours=a.hours))
+        save(state)
+        print("extended: %s now expires %s UTC" % (a.team, s["expires_at"]))
+
+
+def cmd_show(a):
+    state = load()
+    k, s = find_team(state, a.team.strip())
+    if not k or s["status"] != "leased":
+        die("no active lease for %r" % a.team)
+    print(handout(state["config"], a.team.strip(), s))
+
+
+# ------------------------------------------------------------------- status
+def cmd_status(a):
+    state = load()
+    cfg = state["config"]
+    leased = sum(1 for s in state["slots"].values() if s["status"] == "leased")
+    print("slots: %d (%d active + %d spare) | leased: %d | default lease %sh | host %s"
+          % (cfg["slots"], cfg["active"], cfg["slots"] - cfg["active"], leased, cfg["hours"], cfg["host"]))
+    print("%-4s %-5s %-6s %-9s %-24s %-21s %s" % ("slot", "kind", "port", "status", "team", "expires (UTC)", "left"))
+    t = now()
+    for k, s in sorted(state["slots"].items()):
+        left = ""
+        if s["status"] == "leased":
+            m = int((parse(s["expires_at"]) - t).total_seconds() // 60)
+            left = "%dh%02dm" % (m // 60, m % 60) if m > 0 else "EXPIRED"
+        print("%-4s %-5s %-6d %-9s %-24s %-21s %s" % (k, "spare" if s["spare"] else "act", s["port"], s["status"],
+                                                      s.get("team", "-")[:24], s.get("expires_at", "-"), left))
+    print("history: %d finished lease(s)" % len(state["history"]))
+
+
+def cmd_export(a):
+    state = load()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["team", "slot", "address", "leased_at_utc", "expires_at_utc"])
+    for k, s in sorted(state["slots"].items()):
+        if s["status"] == "leased":
+            w.writerow([s["team"], k, "%s:%d" % (state["config"]["host"], s["port"]),
+                        s["leased_at"], s["expires_at"]])
+    sys.stdout.write(buf.getvalue())
+
+
+def cmd_mark(a, to):
+    with locked():
+        state = load()
+        key = slot_key(a.slot)
+        if key not in state["slots"]:
+            die("no such slot")
+        s = state["slots"][key]
+        if to == "bad":
+            if s["status"] == "leased":
+                die("slot is leased; release it first")
+            s["status"] = "bad"; s["note"] = "quarantined by operator"
+        else:
+            if s["status"] != "bad":
+                die("slot is not quarantined")
+            s["status"] = "free"; s.pop("note", None)
+        save(state)
+        print("slot %s -> %s" % (key, s["status"]))
+
+
+# ------------------------------------------------------------------- verify
+def cmd_verify(a):
+    team = a.team.strip()
+    flag = a.flag.strip()
+    if not FLAG_RE.match(flag):
+        print("INVALID: not in BREACH{<64 hex chars>} form (flags 1/2 are fixed strings, not this format)")
+        sys.exit(2)
+    state = load()
+    k, s = find_team(state, team)
+    if k and s["status"] == "leased":
+        if s.get("flag3") == flag:
+            print("VALID: flag 3 matches team %s's live instance (slot %s)" % (team, k)); return
+        print("INVALID: does not match team %s's current instance" % team); sys.exit(2)
+    for h in reversed(state["history"]):
+        if h["team"] == team and h.get("flag3") == flag:
+            print("VALID: flag 3 matches team %s's instance (released %s)" % (team, h["released_at"])); return
+    print("INVALID: no record of flag 3 = %s for team %s" % (flag, team))
+    sys.exit(2)
+
+
+# -------------------------------------------------------------------- stats
+def cmd_stats(a):
+    if DRY:
+        print("(dry) stats skipped"); return
+    out = subprocess.run(["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}"],
+                         text=True, capture_output=True).stdout
+    unit = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3}
+    per, cpu, n_cont = {}, {}, {}
+    for line in out.splitlines():
+        try:
+            name, mem, c = line.split("\t")
+            used = mem.split("/")[0].strip()
+            mm = re.match(r"([\d.]+)\s*([KMG]?i?B)", used)
+            b = float(mm.group(1)) * unit[mm.group(2)]
+        except Exception:  # noqa: BLE001
+            continue
+        proj = name.split("-")[0]
+        per[proj] = per.get(proj, 0) + b
+        cpu[proj] = cpu.get(proj, 0) + float(c.strip("%") or 0)
+        n_cont[proj] = n_cont.get(proj, 0) + 1
+    tot = 0
+    for p in sorted(per):
+        if re.fullmatch(r"ic\d\d", p):
+            print("%-6s %4d MB  cpu %5.1f%%  (%d containers)" % (p, per[p] / 1024 ** 2, cpu[p], n_cont[p]))
+            tot += per[p]
+    free = subprocess.run(["free", "-m"], text=True, capture_output=True).stdout.splitlines()[1].split()
+    print("total stacks: %d MB | host memory used %s / %s MB" % (tot / 1024 ** 2, free[2], free[1]))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="icctl", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("init"); s.add_argument("--slots", type=int, default=50); s.add_argument("--active", type=int, default=40)
+    s.add_argument("--base-port", type=int, default=7001); s.add_argument("--hours", type=float, default=4)
+    s.add_argument("--host", default="ironcold.breachpoint.live"); s.add_argument("--force", action="store_true")
+    s = sub.add_parser("lease"); s.add_argument("team"); s.add_argument("--hours", type=float)
+    s.add_argument("--use-spare", action="store_true"); s.add_argument("--again", action="store_true")
+    s = sub.add_parser("show"); s.add_argument("team")
+    sub.add_parser("status")
+    s = sub.add_parser("release"); s.add_argument("team", nargs="?"); s.add_argument("--slot", type=int)
+    s = sub.add_parser("reap"); s.add_argument("--quiet", action="store_true")
+    s = sub.add_parser("extend"); s.add_argument("team"); s.add_argument("--hours", type=float, required=True)
+    s = sub.add_parser("verify"); s.add_argument("team"); s.add_argument("flag")
+    sub.add_parser("export")
+    for nm in ("bad", "unbad"):
+        s = sub.add_parser(nm); s.add_argument("slot", type=int)
+    sub.add_parser("stats")
+    a = p.parse_args()
+    {"init": cmd_init, "lease": cmd_lease, "show": cmd_show, "status": cmd_status, "release": cmd_release,
+     "reap": cmd_reap, "extend": cmd_extend, "verify": cmd_verify, "export": cmd_export,
+     "bad": lambda x: cmd_mark(x, "bad"), "unbad": lambda x: cmd_mark(x, "unbad"), "stats": cmd_stats}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

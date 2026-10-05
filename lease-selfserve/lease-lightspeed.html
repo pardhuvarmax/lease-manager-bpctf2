@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LightSpeed Technologies — Instance Access</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300..700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --void:      #010102;
+    --chrome-hi: #f6f8fb;
+  }
+  *{ margin:0; padding:0; box-sizing:border-box; }
+  html, body{ height:100%; background:var(--void); }
+  body{
+    position:relative;
+    min-height:100%;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-family:"Space Grotesk", system-ui, sans-serif;
+    padding: 6vw 5vw;
+    overflow-x:hidden;
+  }
+
+  .space{ position:fixed; inset:0; background:
+      radial-gradient(ellipse at 30% 20%, #0d1018 0%, transparent 55%),
+      radial-gradient(ellipse at 75% 80%, #0a0c14 0%, transparent 60%),
+      var(--void); }
+  .stars, .stars-mid, .stars-near{ position:absolute; inset:-5%; background-repeat:repeat; will-change:transform; }
+  .stars{
+    background-image:
+      radial-gradient(1.4px 1.4px at 12% 22%, #fff 100%, transparent 60%),
+      radial-gradient(1px 1px at 38% 68%, #fff 100%, transparent 60%),
+      radial-gradient(1.2px 1.2px at 64% 14%, #fff 100%, transparent 60%),
+      radial-gradient(1px 1px at 81% 47%, #fff 100%, transparent 60%),
+      radial-gradient(1.4px 1.4px at 6% 82%, #fff 100%, transparent 60%),
+      radial-gradient(1px 1px at 92% 76%, #fff 100%, transparent 60%);
+    background-size:900px 900px; opacity:.55; animation:driftSlow 160s linear infinite;
+  }
+  .stars-near{
+    background-image:
+      radial-gradient(1.9px 1.9px at 15% 45%, #fff 100%, transparent 60%),
+      radial-gradient(1.7px 1.7px at 50% 20%, #fff 100%, transparent 60%),
+      radial-gradient(2px 2px at 80% 65%, #fff 100%, transparent 60%),
+      radial-gradient(1.8px 1.8px at 35% 78%, #fff 100%, transparent 60%);
+    background-size:420px 420px; opacity:.9; animation:driftSlow 60s linear infinite, twinkle 3.4s ease-in-out infinite;
+  }
+  @keyframes driftSlow{ from{transform:translate3d(0,0,0);} to{transform:translate3d(-8%,-6%,0);} }
+  @keyframes twinkle{ 0%,100%{opacity:.5;} 50%{opacity:1;} }
+
+  .wisp{ position:absolute; border-radius:50%; mix-blend-mode:screen;
+    background:radial-gradient(circle, rgba(255,255,255,.08), transparent 70%); will-change:transform; }
+  .wisp.w1{ width:60vmax; height:60vmax; left:-10%; top:0%; animation:wisp1 34s ease-in-out infinite; }
+  .wisp.w2{ width:52vmax; height:52vmax; right:-8%; top:20%; animation:wisp2 40s ease-in-out infinite; }
+  @keyframes wisp1{ 0%,100%{transform:translate(0,0) scale(1);} 50%{transform:translate(6vw,5vh) scale(1.08);} }
+  @keyframes wisp2{ 0%,100%{transform:translate(0,0) scale(1);} 50%{transform:translate(-7vw,4vh) scale(.93);} }
+
+  .vignette{ position:absolute; inset:0; z-index:3; pointer-events:none;
+    background:radial-gradient(ellipse at center, transparent 35%, rgba(1,1,2,.65) 82%, var(--void) 100%); }
+
+  .stage{ position:relative; z-index:5; width:100%; max-width:480px; display:flex; flex-direction:column; align-items:center; gap:22px; text-align:center; }
+
+  .eyebrow{ font-weight:400; font-size:.78rem; letter-spacing:.34em; color:rgba(235,238,245,.42); text-transform:uppercase; }
+
+  h1{
+    font-weight:700; font-size:clamp(1.6rem, 5vw, 2.6rem); letter-spacing:-.01em; line-height:1.15;
+    background:linear-gradient(180deg, #5c6068 0%, #cfd3da 15%, var(--chrome-hi) 26%, #eef1f5 32%, #74777f 45%, #2c2e33 57%, #8e919a 67%, var(--chrome-hi) 77%, #3f4147 90%, #101114 100%);
+    background-size:100% 240%; background-position:0 28%; -webkit-background-clip:text; background-clip:text; color:transparent;
+    filter:drop-shadow(0 1px 0 rgba(255,255,255,.25)); animation:sheen 10s ease-in-out infinite;
+  }
+  @keyframes sheen{ 0%,100%{background-position:0 18%;} 50%{background-position:0 82%;} }
+
+  .sub{ font-size:.85rem; color:rgba(220,224,232,.55); line-height:1.7; max-width:38ch; }
+
+  .panel{
+    width:100%; background:rgba(10,11,16,.55); border:1px solid rgba(220,224,232,.14);
+    backdrop-filter:blur(6px); padding:26px; display:flex; flex-direction:column; gap:12px;
+  }
+  .panel label{ font-size:.68rem; letter-spacing:.22em; color:rgba(235,238,245,.4); text-align:left; text-transform:uppercase; }
+  input{
+    width:100%; background:rgba(255,255,255,.04); border:1px solid rgba(220,224,232,.22);
+    color:var(--chrome-hi); padding:12px 14px; font:inherit; font-size:.95rem; letter-spacing:.02em;
+  }
+  input:focus{ outline:0; border-color:rgba(220,224,232,.6); }
+  button{
+    margin-top:6px; padding:13px; border:0; cursor:pointer; font:inherit; font-weight:600; font-size:.85rem;
+    letter-spacing:.12em; text-transform:uppercase;
+    background:linear-gradient(180deg, #eef1f5, #b9bdc6);
+    color:#101114;
+  }
+  button:hover:not(:disabled){ background:linear-gradient(180deg, #ffffff, #d4d8e0); }
+  button:disabled{ opacity:.45; cursor:wait; }
+
+  .result{ width:100%; margin-top:4px; border:1px solid rgba(220,224,232,.14); background:rgba(255,255,255,.03); padding:16px; display:none; text-align:left; }
+  .result.show{ display:block; }
+  .result.err{ border-color:rgba(232,180,120,.45); background:rgba(232,180,120,.06); color:#e8c088; font-size:.85rem; line-height:1.6; }
+  .row{ display:flex; justify-content:space-between; gap:14px; padding:8px 0; border-bottom:1px solid rgba(220,224,232,.1); font-size:.8rem; }
+  .row:last-child{ border-bottom:0; }
+  .row span{ color:rgba(220,224,232,.5); letter-spacing:.05em; }
+  .row b{ color:var(--chrome-hi); font-weight:600; word-break:break-all; text-align:right; font-variant-numeric:tabular-nums; }
+
+  .note{ font-size:.68rem; color:rgba(220,224,232,.35); line-height:1.7; letter-spacing:.02em; max-width:40ch; }
+</style>
+</head>
+<body>
+  <div class="space">
+    <div class="stars"></div>
+    <div class="stars-near"></div>
+    <div class="wisp w1"></div>
+    <div class="wisp w2"></div>
+    <div class="vignette"></div>
+  </div>
+
+  <div class="stage">
+    <div class="eyebrow">LightSpeed Technologies</div>
+    <h1>Instance Access</h1>
+    <p class="sub">One account per team. Enter your team name to receive your
+    endpoint and bearer token.</p>
+
+    <div class="panel">
+      <label for="team">Team name</label>
+      <input id="team" maxlength="48" placeholder="e.g. Nullptr Dereference" autocomplete="off">
+      <button id="go">Request Access</button>
+    </div>
+
+    <div class="result" id="result"></div>
+
+    <p class="note">Re-submitting your own team name always returns your
+    existing account, never a new one — safe to check back anytime your
+    lease is close to expiring.</p>
+  </div>
+
+<script>
+const go = document.getElementById("go");
+const input = document.getElementById("team");
+const result = document.getElementById("result");
+
+async function submit() {
+  const team = input.value.trim();
+  if (!team) return;
+  go.disabled = true;
+  result.className = "result show";
+  result.textContent = "Requesting access…";
+  try {
+    const resp = await fetch("/api/lease", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ team })
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      result.className = "result show err";
+      result.textContent = data.error || "something went wrong";
+      return;
+    }
+    result.className = "result show";
+    result.innerHTML = `
+      <div class="row"><span>gRPC Endpoint</span><b>${data.address}</b></div>
+      <div class="row"><span>Bearer Token</span><b>${data.token || ""}</b></div>
+      <div class="row"><span>Status</span><b>${data.status === "existing" ? "Existing account" : "Provisioned"}</b></div>
+    `;
+  } catch (e) {
+    result.className = "result show err";
+    result.textContent = "network error — try again";
+  } finally {
+    go.disabled = false;
+  }
+}
+
+go.addEventListener("click", submit);
+input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+</script>
+</body>
+</html>

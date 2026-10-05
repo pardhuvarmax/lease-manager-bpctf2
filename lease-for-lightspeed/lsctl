@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+"""lsctl - LightSpeed lease manager (organizer-only).
+
+LightSpeed is one-identity-per-participant: each instance has ONE seeded account
+(strikes, the 2 h lockout and the single flag claim live on it). With hundreds of
+players we run a shared pool of isolated compose stacks ("slots") and lease one to
+each active team for a limited time. When a lease ends the stack is destroyed
+(`down -v`), so the slot returns fresh to the pool. One lease per team by default:
+a second lease would give the team a fresh account and reset its strikes.
+
+Slots 1..ACTIVE are the normal pool; the remaining slots are spares, used only with
+--use-spare or when you quarantine an active slot (`lsctl bad N`).
+
+State lives in $LS_STATE_DIR/state.json (atomic writes); per-slot secrets are in
+$LS_STATE_DIR/slots/NN/.env (mode 600). Python 3 stdlib only.
+
+  lsctl init [--slots 50] [--active 40] [--base-port 4001] [--hours 4] [--host H]
+  lsctl lease TEAM [--hours H] [--use-spare] [--again]
+  lsctl show TEAM                 reprint address + token
+  lsctl status                    slots table
+  lsctl release TEAM|--slot N     tear down now (records any redeemed flags)
+  lsctl reap                      release expired leases (run by the systemd timer)
+  lsctl extend TEAM --hours H
+  lsctl verify TEAM FLAG          is FLAG a real, redeemed claim of TEAM's instance?
+  lsctl export                    CSV of active leases (contains tokens!)
+  lsctl bad N | unbad N           quarantine / restore a slot
+  lsctl stats                     per-slot memory (docker stats)
+LS_DRY=1 skips docker (for tests).
+"""
+import argparse
+import csv
+import fcntl
+import hashlib
+import hmac
+import io
+import json
+import os
+import re
+import secrets
+import socket
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+
+STACK_DIR = os.environ.get("LS_STACK_DIR", "/opt/lightspeed/stack")
+STATE_DIR = os.environ.get("LS_STATE_DIR", "/var/lib/lightspeed")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+SLOTS_DIR = os.path.join(STATE_DIR, "slots")
+DRY = os.environ.get("LS_DRY") == "1"
+FLAG_RE = re.compile(r"^BREACH\{lightspeed_(clm_[0-9a-f]{24})_([0-9a-f]{16})\}$")
+TEAM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,63}$")
+FLAG_KEY = b"299792458"
+
+
+# ----------------------------------------------------------------- helpers
+def now():
+    return datetime.now(timezone.utc)
+
+
+def iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse(s):
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def die(msg, code=1):
+    print("error: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+@contextmanager
+def locked():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, ".lock"), "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def load():
+    if not os.path.exists(STATE_FILE):
+        die("not initialised: run `lsctl init` first")
+    with open(STATE_FILE) as f:
+        return json.load(f)
+
+
+def save(state):
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)
+
+
+def slot_key(n):
+    return "%02d" % n
+
+
+def slot_dir(n):
+    return os.path.join(SLOTS_DIR, slot_key(n))
+
+
+def project(n):
+    return "ls" + slot_key(n)
+
+
+def cfg_get(state, k):
+    return state["config"][k]
+
+
+def run(cmd, check=True, capture=False, timeout=None):
+    if DRY:
+        print("  [dry] " + " ".join(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    return subprocess.run(cmd, check=check, text=True, timeout=timeout,
+                          stdout=subprocess.PIPE if capture else None,
+                          stderr=subprocess.PIPE if capture else None)
+
+
+def compose(n, *args, **kw):
+    d = slot_dir(n)
+    cmd = ["docker", "compose", "-p", project(n), "--project-directory", STACK_DIR,
+           "--env-file", os.path.join(d, ".env"),
+           "-f", os.path.join(STACK_DIR, "docker-compose.yml"),
+           "-f", os.path.join(STACK_DIR, "docker-compose.prod.yml"),
+           "-f", os.path.join(STACK_DIR, "docker-compose.images.yml"),
+           "-f", os.path.join(STACK_DIR, "docker-compose.datastores.yml"),
+           "-f", os.path.join(d, "override.yml")] + list(args)
+    return run(cmd, **kw)
+
+
+def psql(n, sql):
+    """Run a read-only query in this slot's ledger-db; returns stdout or None."""
+    if DRY:
+        return ""
+    r = subprocess.run(["docker", "exec", "%s-ledger-db-1" % project(n), "psql", "-U", "ledger",
+                        "-d", "ledger", "-At", "-F", ",", "-c", sql],
+                       text=True, capture_output=True, timeout=20)
+    return r.stdout if r.returncode == 0 else None
+
+
+def compute_flag(claim_id):
+    chk = hmac.new(FLAG_KEY, claim_id.encode(), hashlib.sha256).hexdigest()[:16]
+    return "BREACH{lightspeed_%s_%s}" % (claim_id, chk)
+
+
+def read_env(n):
+    env = {}
+    p = os.path.join(slot_dir(n), ".env")
+    if os.path.exists(p):
+        for line in open(p):
+            if "=" in line and not line.startswith("#"):
+                k, v = line.rstrip("\n").split("=", 1)
+                env[k] = v
+    return env
+
+
+def handout(state, team, n, entry):
+    cfg = state["config"]
+    tok = read_env(n).get("SEED_PLAYER_TOKEN", "<missing>")
+    return "\n".join([
+        "=== LightSpeed instance ===",
+        "Team    : %s" % team,
+        "gRPC    : %s:%d   (plaintext HTTP/2 gRPC, e.g. grpcurl -plaintext)" % (cfg["host"], entry["port"]),
+        "Token   : %s" % tok,
+        "Leased  : %s" % entry["leased_at"],
+        "Expires : %s UTC" % entry["expires_at"],
+    ])
+
+
+def find_team(state, team):
+    for k, s in state["slots"].items():
+        if s.get("team") == team and s["status"] in ("leased", "starting", "releasing"):
+            return k, s
+    return None, None
+
+
+# --------------------------------------------------------------------- init
+def cmd_init(a):
+    with locked():
+        if os.path.exists(STATE_FILE) and not a.force:
+            die("already initialised (use --force to wipe state.json; running stacks are NOT touched)")
+        if a.active > a.slots:
+            die("--active cannot exceed --slots")
+        state = {"config": {"slots": a.slots, "active": a.active, "base_port": a.base_port,
+                            "hours": a.hours, "host": a.host, "direct_api": a.direct_api, "balance": a.balance},
+                 "slots": {}, "history": []}
+        for i in range(1, a.slots + 1):
+            state["slots"][slot_key(i)] = {"status": "free", "port": a.base_port + i - 1,
+                                           "spare": i > a.active}
+        os.makedirs(SLOTS_DIR, exist_ok=True)
+        save(state)
+    print("initialised: %d slots (%d active + %d spare), ports %d-%d, default lease %sh"
+          % (a.slots, a.active, a.slots - a.active, a.base_port, a.base_port + a.slots - 1, a.hours))
+
+
+# -------------------------------------------------------------------- lease
+def write_slot_files(n, port, direct_api="false", balance=1000):
+    d = slot_dir(n)
+    os.makedirs(d, exist_ok=True)
+    os.chmod(d, 0o700)
+    env = [
+        "LEDGER_DB_PASSWORD=" + secrets.token_hex(24),
+        "GATEWAY_HMAC_SECRET=" + secrets.token_hex(32),
+        "INTERNAL_SECRET=" + secrets.token_hex(32),
+        "SEED_PLAYER_TOKEN=" + secrets.token_hex(24),
+        "SEED_PLAYER_BALANCE=%d" % balance,
+        "LOCKOUT_DURATION_SECONDS=7200",
+        "DIRECT_API_ENABLED=" + direct_api,
+    ]
+    p = os.path.join(d, ".env")
+    with open(p, "w") as f:
+        f.write("\n".join(env) + "\n")
+    os.chmod(p, 0o600)
+    with open(os.path.join(d, "override.yml"), "w") as f:
+        f.write("# generated by lsctl; publishes this slot's gRPC port on all interfaces so the\n"
+                "# frontdoor sees real client IPs (its churn rule is keyed by source IP).\n"
+                "services:\n  frontdoor:\n    ports: !override\n      - \"%d:4000\"\n" % port)
+
+
+def wait_ready(n, port, timeout=150):
+    if DRY:
+        return True
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=2):
+                pass
+            r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", "%s-frontdoor-1" % project(n)],
+                               text=True, capture_output=True)
+            if r.stdout.strip() == "true":
+                return True
+        except OSError:
+            pass
+        time.sleep(2)
+    return False
+
+
+def teardown(n):
+    try:
+        compose(n, "down", "-v", "--remove-orphans", check=False, timeout=180)
+    except Exception as e:  # noqa: BLE001 - keep going, caller marks state
+        print("  warning: teardown of %s raised %s" % (project(n), e), file=sys.stderr)
+    d = slot_dir(n)
+    for f in (".env", "override.yml"):
+        try:
+            os.remove(os.path.join(d, f))
+        except FileNotFoundError:
+            pass
+
+
+def cmd_lease(a):
+    team = a.team.strip()
+    if not TEAM_RE.match(team):
+        die("team name must be 1-64 chars: letters, digits, space, _ . -")
+    with locked():
+        state = load()
+        k, s = find_team(state, team)
+        if k:
+            if s["status"] == "leased":
+                print("(team already has an active lease)\n")
+                print(handout(state, team, int(k), s))
+                return
+            die("team %s is mid-operation on slot %s (%s); retry shortly" % (team, k, s["status"]))
+        if not a.again and any(h["team"] == team for h in state["history"]):
+            die("team %s already had a lease (one per team). Use --again to override on purpose; "
+                "a new lease resets its strikes/lockout." % team)
+        cfg = state["config"]
+        in_use = sum(1 for x in state["slots"].values() if x["status"] in ("leased", "starting"))
+        free = [kk for kk, x in sorted(state["slots"].items()) if x["status"] == "free"]
+        pick = [kk for kk in free if not state["slots"][kk]["spare"]]
+        if not pick and a.use_spare:
+            pick = [kk for kk in free if state["slots"][kk]["spare"]]
+        if not pick:
+            die("no free slot (%d in use of %d active%s). Release one, or use --use-spare."
+                % (in_use, cfg["active"], "; spares exist" if any(state["slots"][kk]["spare"] for kk in free) else ""))
+        key = pick[0]
+        n = int(key)
+        hours = a.hours if a.hours is not None else cfg["hours"]
+        t0 = now()
+        direct = a.direct_api or cfg.get("direct_api", "true")
+        balance = a.balance if a.balance is not None else cfg.get("balance", 10000)
+        entry = state["slots"][key]
+        entry.update({"status": "starting", "team": team, "leased_at": iso(t0),
+                      "expires_at": iso(t0 + timedelta(hours=hours)), "direct_api": direct, "balance": balance})
+        save(state)
+    # --- slow part, outside the lock
+    try:
+        write_slot_files(n, entry["port"], direct, balance)
+        compose(n, "up", "-d", "--no-build")
+        ok = wait_ready(n, entry["port"])
+    except Exception as e:  # noqa: BLE001
+        print("  lease failed: %s" % e, file=sys.stderr)
+        ok = False
+    with locked():
+        state = load()
+        entry = state["slots"][key]
+        if not ok:
+            teardown(n)
+            entry.update({"status": "bad", "note": "failed to start for team %s at %s" % (team, iso(now()))})
+            entry.pop("team", None); entry.pop("leased_at", None); entry.pop("expires_at", None); entry.pop("direct_api", None); entry.pop("balance", None)
+            save(state)
+            die("slot %s failed to start; quarantined as bad. Try again (another slot is used)." % key)
+        entry["status"] = "leased"
+        save(state)
+        print(handout(state, team, n, entry))
+
+
+# ------------------------------------------------------------------ release
+def capture_claims(n):
+    out = psql(n, "SELECT claim_id, status FROM claims ORDER BY created_at")
+    claims = []
+    for line in (out or "").splitlines():
+        if "," in line:
+            cid, st = line.split(",", 1)
+            claims.append({"claim_id": cid, "status": st,
+                           "flag": compute_flag(cid) if st == "REDEEMED" else None})
+    return claims
+
+
+def release_slot(key, reason):
+    n = int(key)
+    with locked():
+        state = load()
+        s = state["slots"][key]
+        if s["status"] not in ("leased", "bad"):
+            return False
+        team = s.get("team")
+        was_leased = s["status"] == "leased"
+        s["status"] = "releasing"
+        save(state)
+    claims = capture_claims(n) if was_leased else []
+    teardown(n)
+    with locked():
+        state = load()
+        s = state["slots"][key]
+        if was_leased:
+            state["history"].append({"team": team, "slot": key, "port": s["port"],
+                                     "leased_at": s.get("leased_at"), "released_at": iso(now()),
+                                     "reason": reason, "claims": claims})
+        for f in ("team", "leased_at", "expires_at", "note", "direct_api", "balance"):
+            s.pop(f, None)
+        s["status"] = "free"
+        save(state)
+    redeemed = [c for c in claims if c["status"] == "REDEEMED"]
+    print("released slot %s (%s)%s" % (key, reason, "; redeemed claim recorded for %s" % team if redeemed else ""))
+    return True
+
+
+def cmd_release(a):
+    state = load()
+    if a.slot is not None:
+        key = slot_key(a.slot)
+    elif a.team:
+        key, _ = find_team(state, a.team.strip())
+        if not key:
+            die("no active lease for team %r" % a.team)
+    else:
+        die("give TEAM or --slot N")
+    if not release_slot(key, "manual"):
+        die("slot %s is not leased" % key)
+
+
+def cmd_reap(a):
+    state = load()
+    t = now()
+    due = [k for k, s in sorted(state["slots"].items())
+           if s["status"] == "leased" and parse(s["expires_at"]) <= t]
+    for k in due:
+        release_slot(k, "expired")
+    if not due and not a.quiet:
+        print("nothing expired")
+
+
+def cmd_extend(a):
+    with locked():
+        state = load()
+        k, s = find_team(state, a.team.strip())
+        if not k or s["status"] != "leased":
+            die("no active lease for %r" % a.team)
+        s["expires_at"] = iso(parse(s["expires_at"]) + timedelta(hours=a.hours))
+        save(state)
+        print("extended: %s now expires %s UTC" % (a.team, s["expires_at"]))
+
+
+def cmd_show(a):
+    state = load()
+    k, s = find_team(state, a.team.strip())
+    if not k or s["status"] != "leased":
+        die("no active lease for %r" % a.team)
+    print(handout(state, a.team.strip(), int(k), s))
+
+
+# ------------------------------------------------------------------- status
+def cmd_status(a):
+    state = load()
+    cfg = state["config"]
+    leased = sum(1 for s in state["slots"].values() if s["status"] == "leased")
+    print("slots: %d (%d active + %d spare) | leased: %d | default lease %sh | host %s | direct_api default: %s | balance default: %s"
+          % (cfg["slots"], cfg["active"], cfg["slots"] - cfg["active"], leased, cfg["hours"], cfg["host"], cfg.get("direct_api", "true"), cfg.get("balance", 10000)))
+    print("%-4s %-5s %-6s %-9s %-24s %-21s %s" % ("slot", "kind", "port", "status", "team", "expires (UTC)", "left"))
+    t = now()
+    for k, s in sorted(state["slots"].items()):
+        left = ""
+        if s["status"] == "leased":
+            m = int((parse(s["expires_at"]) - t).total_seconds() // 60)
+            left = "%dh%02dm" % (m // 60, m % 60) if m > 0 else "EXPIRED"
+        print("%-4s %-5s %-6d %-9s %-24s %-21s %s" % (k, "spare" if s["spare"] else "act", s["port"], s["status"],
+                                                      s.get("team", "-")[:24], s.get("expires_at", "-"),
+                                                      left + ("" if s.get("direct_api") in (None, cfg.get("direct_api", "true")) else " [direct-api=%s]" % s["direct_api"])
+                                                      + ("" if s.get("balance") in (None, cfg.get("balance", 10000)) else " [bal=%s]" % s["balance"])))
+    print("history: %d finished lease(s)" % len(state["history"]))
+
+
+def cmd_export(a):
+    state = load()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["team", "slot", "address", "token", "leased_at_utc", "expires_at_utc"])
+    for k, s in sorted(state["slots"].items()):
+        if s["status"] == "leased":
+            w.writerow([s["team"], k, "%s:%d" % (state["config"]["host"], s["port"]),
+                        read_env(int(k)).get("SEED_PLAYER_TOKEN", ""), s["leased_at"], s["expires_at"]])
+    sys.stdout.write(buf.getvalue())
+
+
+def cmd_mark(a, to):
+    with locked():
+        state = load()
+        key = slot_key(a.slot)
+        if key not in state["slots"]:
+            die("no such slot")
+        s = state["slots"][key]
+        if to == "bad":
+            if s["status"] == "leased":
+                die("slot is leased; release it first")
+            s["status"] = "bad"; s["note"] = "quarantined by operator"
+        else:
+            if s["status"] != "bad":
+                die("slot is not quarantined")
+            s["status"] = "free"; s.pop("note", None)
+        save(state)
+        print("slot %s -> %s" % (key, s["status"]))
+
+
+# ------------------------------------------------------------------- verify
+def cmd_verify(a):
+    team = a.team.strip()
+    m = FLAG_RE.match(a.flag.strip())
+    if not m:
+        print("INVALID: not in BREACH{lightspeed_clm_<24 hex>_<16 hex>} form"); sys.exit(2)
+    claim_id, chk = m.group(1), m.group(2)
+    if compute_flag(claim_id) != a.flag.strip():
+        print("INVALID: checksum does not match the claim id"); sys.exit(2)
+    state = load()
+    k, s = find_team(state, team)
+    if k and s["status"] == "leased":
+        out = psql(int(k), "SELECT status FROM claims WHERE claim_id = '%s'" % claim_id)
+        if out is None:
+            print("ERROR: could not query the team's ledger"); sys.exit(3)
+        st = out.strip()
+        if st == "REDEEMED":
+            print("VALID: redeemed claim %s belongs to team %s (live instance, slot %s)" % (claim_id, team, k)); return
+        print("INVALID: claim %s is %s in %s's instance" % (claim_id, st or "absent", team)); sys.exit(2)
+    for h in reversed(state["history"]):
+        if h["team"] == team:
+            for c in h["claims"]:
+                if c["claim_id"] == claim_id and c["status"] == "REDEEMED":
+                    print("VALID: redeemed claim %s belongs to team %s (recorded at release %s)" % (claim_id, team, h["released_at"])); return
+    print("INVALID: no redeemed claim %s for team %s (a flag from another team's instance does not count)" % (claim_id, team))
+    sys.exit(2)
+
+
+# -------------------------------------------------------------------- stats
+def cmd_stats(a):
+    if DRY:
+        print("(dry) stats skipped"); return
+    out = subprocess.run(["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}"],
+                         text=True, capture_output=True).stdout
+    unit = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3}
+    per, cpu, n_cont = {}, {}, {}
+    for line in out.splitlines():
+        try:
+            name, mem, c = line.split("\t")
+            used = mem.split("/")[0].strip()
+            mm = re.match(r"([\d.]+)\s*([KMG]?i?B)", used)
+            b = float(mm.group(1)) * unit[mm.group(2)]
+        except Exception:  # noqa: BLE001
+            continue
+        proj = name.split("-")[0]
+        per[proj] = per.get(proj, 0) + b
+        cpu[proj] = cpu.get(proj, 0) + float(c.strip("%") or 0)
+        n_cont[proj] = n_cont.get(proj, 0) + 1
+    tot = 0
+    for p in sorted(per):
+        if re.fullmatch(r"ls\d\d", p):
+            print("%-6s %4d MB  cpu %5.1f%%  (%d containers)" % (p, per[p] / 1024 ** 2, cpu[p], n_cont[p]))
+            tot += per[p]
+    free = subprocess.run(["free", "-m"], text=True, capture_output=True).stdout.splitlines()[1].split()
+    print("total stacks: %d MB | host memory used %s / %s MB" % (tot / 1024 ** 2, free[2], free[1]))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="lsctl", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("init"); s.add_argument("--slots", type=int, default=50); s.add_argument("--active", type=int, default=40)
+    s.add_argument("--base-port", type=int, default=4001); s.add_argument("--hours", type=float, default=4)
+    s.add_argument("--host", default="lightspeed.breachpoint.live"); s.add_argument("--force", action="store_true")
+    s.add_argument("--direct-api", choices=["true", "false"], default="true",
+                   help="DIRECT_API_ENABLED default for new leases (true = the design economy; false = optional locked-down ExecuteChallenge variant)")
+    s.add_argument("--balance", type=int, default=10000,
+                   help="SEED_PLAYER_BALANCE default (10000 = the design economy)")
+    s = sub.add_parser("lease"); s.add_argument("team"); s.add_argument("--hours", type=float)
+    s.add_argument("--use-spare", action="store_true"); s.add_argument("--again", action="store_true")
+    s.add_argument("--direct-api", choices=["true", "false"], help="override DIRECT_API_ENABLED for this lease only (testing)")
+    s.add_argument("--balance", type=int, help="override SEED_PLAYER_BALANCE for this lease only (testing)")
+    s = sub.add_parser("show"); s.add_argument("team")
+    sub.add_parser("status")
+    s = sub.add_parser("release"); s.add_argument("team", nargs="?"); s.add_argument("--slot", type=int)
+    s = sub.add_parser("reap"); s.add_argument("--quiet", action="store_true")
+    s = sub.add_parser("extend"); s.add_argument("team"); s.add_argument("--hours", type=float, required=True)
+    s = sub.add_parser("verify"); s.add_argument("team"); s.add_argument("flag")
+    sub.add_parser("export")
+    for nm in ("bad", "unbad"):
+        s = sub.add_parser(nm); s.add_argument("slot", type=int)
+    sub.add_parser("stats")
+    a = p.parse_args()
+    {"init": cmd_init, "lease": cmd_lease, "show": cmd_show, "status": cmd_status, "release": cmd_release,
+     "reap": cmd_reap, "extend": cmd_extend, "verify": cmd_verify, "export": cmd_export,
+     "bad": lambda x: cmd_mark(x, "bad"), "unbad": lambda x: cmd_mark(x, "unbad"), "stats": cmd_stats}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()
