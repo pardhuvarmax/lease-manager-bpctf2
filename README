@@ -1,89 +1,119 @@
 # Lease Manager — BPCTF2
 
-Self-service cloud provisioning and lease management system built for **Breach Point CTF 2026 — Season 2 (BPCTF2)**.
+Production self-service cloud provisioning and lease management system built for BPCTF2.
 
-The system allows CTF teams to provision their own isolated challenge instances without requiring an organizer to manually execute provisioning commands and distribute connection details.
+Lease Manager provides teams with a self-service interface for requesting challenge infrastructure, while handling lease allocation, idempotent requests, rate limiting, provisioning, and integration with the underlying challenge control systems.
 
 ## Overview
 
-During BPCTF2, challenge instances for **Iron Cold** and **LightSpeed** were provisioned dynamically from a finite instance pool.
+Lease Manager was developed for BPCTF2 to simplify the provisioning of isolated challenge instances during a live CTF.
 
-Previously, the workflow required an organizer to manually run:
+Instead of requiring organizers to manually allocate infrastructure to teams, players could request an instance through a web interface. The service handled the request, invoked the appropriate infrastructure control utility, and returned the allocated challenge endpoint.
 
-```bash
-icctl lease "Team Name"
-```
+The system was designed to operate during a live event where provisioning requests could arrive concurrently and where infrastructure availability and abuse prevention were important operational concerns.
 
-or:
-
-```bash
-lsctl lease "Team Name"
-```
-
-and then send the resulting connection information to the team.
-
-**Lease Manager** replaces that manual step with a self-service HTTP interface.
+## Architecture
 
 ```text
-Team
- │
- ▼
-Lease Web Interface
- │
- ▼
-nginx / HTTPS
- │
- ▼
-leased.py
- │
- ├── Team validation
- ├── Rate limiting
- ├── Idempotent lease lookup
- └── Provisioning request
-        │
-        ▼
-   icctl / lsctl
-        │
-        ▼
- Docker Compose
-        │
-        ▼
-Challenge Instance
+                        ┌─────────────────────┐
+                        │      Players        │
+                        └──────────┬──────────┘
+                                   │
+                                   │ HTTPS
+                                   ▼
+                        ┌─────────────────────┐
+                        │       Nginx         │
+                        │  TLS + Reverse Proxy│
+                        └──────────┬──────────┘
+                                   │
+                                   │ /api/*
+                                   ▼
+                        ┌─────────────────────┐
+                        │      leased.py      │
+                        │   Lease HTTP API    │
+                        └──────────┬──────────┘
+                                   │
+                         ┌─────────┴─────────┐
+                         │                   │
+                         ▼                   ▼
+                  ┌─────────────┐     ┌─────────────┐
+                  │    icctl    │     │    lsctl    │
+                  │ Iron Cold   │     │ LightSpeed  │
+                  └──────┬──────┘     └──────┬──────┘
+                         │                   │
+                         └─────────┬─────────┘
+                                   ▼
+                        ┌─────────────────────┐
+                        │ Challenge           │
+                        │ Infrastructure      │
+                        │ Docker / Instances   │
+                        └─────────────────────┘
 ```
-
-The same backend supports both BPCTF2 challenge environments through configuration.
 
 ## Components
 
-### `lease-selfserve`
+### leased.py
 
-Self-service provisioning layer.
+The main self-service lease API.
 
-- `leased.py` — stdlib-only Python HTTP backend
-- `lease.html` — Iron Cold frontend
-- `lease-lightspeed.html` — LightSpeed frontend
-- `leased.service.template.txt` — systemd service template
-- `DEPLOY.md` — deployment and operational documentation
+Implemented as a lightweight Python HTTP service using the Python standard library.
 
-The backend listens only on:
+Default configuration:
 
 ```text
-127.0.0.1:8088
+Host: 127.0.0.1
+Port: 8088
 ```
 
-and is exposed externally through nginx.
+The service is configured through environment variables:
 
-### `lease-for-ironcold`
+```text
+LEASED_CTL
+LEASED_MODE
+LEASED_PORT
+LEASED_SUDO
+```
 
-Iron Cold provisioning tooling and deployment configuration.
+Supported modes:
 
-### `lease-for-lightspeed`
+```text
+lightspeed
+ironcold
+```
 
-LightSpeed provisioning tooling and deployment configuration.
+### icctl
+
+Control utility used for Iron Cold infrastructure operations.
+
+### lsctl
+
+Control utility used for LightSpeed infrastructure operations.
+
+### nginx
+
+Provides:
+
+- TLS termination
+- HTTPS access
+- Reverse proxying
+- Static file serving
+- API forwarding to the lease service
+
+### systemd
+
+The lease service runs as a systemd service with automatic restart behavior.
 
 ## API
 
-### Create or retrieve a lease
+### Health Check
+
+```http
+GET /api/health
+```
+
+Returns the service health status.
+
+### Request a Lease
 
 ```http
 POST /api/lease
@@ -94,180 +124,232 @@ Request:
 
 ```json
 {
-  "team": "Example Team"
+  "team": "team-name"
 }
 ```
 
-Possible successful responses include:
+The team name is validated before provisioning.
 
-```json
-{
-  "status": "created",
-  "address": "..."
-}
-```
-
-or:
-
-```json
-{
-  "status": "existing",
-  "address": "..."
-}
-```
-
-For LightSpeed, the response may additionally contain the provisioned service token.
-
-### Health check
-
-```http
-GET /api/health
-```
-
-Example:
-
-```json
-{
-  "status": "ok",
-  "mode": "lightspeed"
-}
-```
-
-## Lease Semantics
-
-Lease creation is intentionally **idempotent**.
-
-Before attempting to provision a new instance, the backend checks whether the requested team already has an active lease:
+Accepted team names follow:
 
 ```text
-show <team>
+^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,47}$
+```
+
+## Lease Allocation
+
+A lease request follows an idempotent allocation flow.
+
+```text
+Request
    │
-   ├── existing → return existing lease
+   ▼
+Validate team
    │
-   └── absent → create new lease
+   ▼
+Check existing lease
+   │
+   ├── Exists ──────► Return existing lease
+   │
+   ▼
+Check rate limits
+   │
+   ▼
+Provision infrastructure
+   │
+   ├── Success ─────► Return lease
+   │
+   ├── Already exists ─► Return existing lease
+   │
+   ├── Pool full ──────► Return failure
+   │
+   └── Error ──────────► Return failure
 ```
 
-This is important because provisioning a new instance can take approximately **10–25 seconds** due to cold Docker Compose startup.
+If a team already has a lease, the service returns the existing allocation rather than attempting to provision another instance.
 
-If a client times out while provisioning is still completing, submitting the same team name again resolves to the existing lease rather than creating another instance.
+This also protects against duplicate provisioning when a previous request takes longer than the client's HTTP timeout.
 
-## Abuse Controls
+Provisioning can take approximately 10–25 seconds when a challenge environment requires a cold Docker Compose startup.
 
-Because BPCTF2 was already live when this system was introduced, pre-issued per-team authentication codes were not practical.
+## Rate Limiting
 
-The deployment therefore used bounded, name-based access with explicit abuse controls.
+The service includes application-level abuse controls.
 
-### Per-IP distinct-team limit
+Current limits include:
 
-A source IP can claim at most:
+- Maximum 5 distinct team names per source IP per hour
+- Maximum 12 requests per minute per source IP
+- Re-fetching an existing team's lease does not count as a new distinct-team claim
 
-```text
-5 distinct team names / hour
-```
+Rate-limit state is maintained in process memory and protected by a lock.
 
-This limits how quickly a single source can consume the finite instance pool with fabricated team names.
+These controls were designed specifically for the operational conditions of the live CTF.
 
-### Request rate limit
+## Security Model
 
-A source IP is additionally limited to:
+The original BPCTF2 deployment intentionally did not implement identity verification at the lease endpoint.
 
-```text
-12 requests / minute
-```
+This was a deliberate operational trade-off because the event was already running and the priority was providing a usable self-service provisioning mechanism.
 
-Repeated requests for an already-known team do not consume the distinct-team allocation limit.
+The resulting limitation is that a user could theoretically request a lease using another team's name.
 
-## Known Security Limitation
+The deployment therefore relied on:
 
-The BPCTF2 deployment does **not provide identity verification**.
+- Per-IP request limits
+- Per-IP distinct-team limits
+- Existing-lease checks
+- Operational monitoring
+- Manual quarantine of abused allocations
 
-A user who knows or guesses another team's name could theoretically request that team's lease.
-
-This was an accepted event-time tradeoff because the system was introduced after the competition had already started.
-
-The per-IP distinct-team limit bounds the amount of infrastructure that can be consumed by a single source.
-
-For the BPCTF2 deployment, abused instances could additionally be quarantined through the existing `icctl` / `lsctl` operational tooling.
+If necessary, organizers could quarantine an abused slot using the underlying control utilities.
 
 ## Deployment
 
-The production deployment uses:
+The production deployment used:
 
-- GCP Compute Engine
-- Docker / Docker Compose
-- Python
-- nginx
+- Google Cloud Platform
+- Compute Engine
+- Docker
+- Docker Compose
+- Nginx
 - systemd
-- HTTPS
-- IAP-only SSH access
+- Python
+- IAP-based SSH access
+- Let's Encrypt TLS certificates
 
-The backend is intentionally not exposed directly to the network.
+The production environment was deployed in the GCP project:
 
 ```text
-Internet
-   │
- HTTPS
-   ▼
- nginx
-   │
-   │ reverse proxy
-   ▼
-127.0.0.1:8088
-   │
-   ▼
-leased.py
+breachpoint-overflow-15140
 ```
 
-The systemd service runs the backend and restarts it automatically on failure.
+Zone:
 
-See [`DEPLOY.md`](./lease-selfserve/DEPLOY.md) for the BPCTF2 deployment procedure and operational notes.
+```text
+us-central1-a
+```
 
-## Operational Behavior
+SSH access was performed through Identity-Aware Proxy rather than exposing SSH directly to the public internet.
 
-Provisioning failures are translated into explicit API responses where possible.
+## Deployment Structure
 
-Examples include:
+The self-service service contains:
 
-- Existing lease
-- Provisioning already in progress
-- Instance pool exhaustion
-- Provisioning failure
-- Successful provisioning with unparseable output
+```text
+lease-selfserve/
+├── leased.py
+├── lease.html
+├── lease-lightspeed.html
+├── leased.service.template.txt
+├── DEPLOY.md
+└── README.md
+```
 
-The provisioning commands are executed with a bounded subprocess timeout, and the backend parses the resulting control-plane output into a stable API response.
+Challenge-specific infrastructure is separated into:
+
+```text
+lease-for-ironcold/
+├── icctl
+├── docker-compose.yml
+└── install.sh
+```
+
+and:
+
+```text
+lease-for-lightspeed/
+├── lsctl
+├── docker-compose.datastores.yml
+├── docker-compose.images.yml
+└── install.sh
+```
+
+## Production Redeployment
+
+The lease service could be updated without rebuilding the entire infrastructure.
+
+Example deployment flow:
+
+```bash
+gcloud compute scp leased.py <vm>:~/leased.py \
+  --zone=us-central1-a \
+  --project=breachpoint-overflow-15140 \
+  --tunnel-through-iap
+```
+
+Then:
+
+```bash
+gcloud compute ssh <vm> \
+  --zone=us-central1-a \
+  --project=breachpoint-overflow-15140 \
+  --tunnel-through-iap \
+  --command='sudo cp ~/leased.py /opt/leased/leased.py && sudo systemctl restart leased'
+```
+
+## Operational Characteristics
+
+The service was designed around several practical requirements of a live CTF:
+
+### Self-Service Provisioning
+
+Players can request infrastructure without requiring an organizer to manually allocate an instance.
+
+### Idempotency
+
+Repeated requests for the same team return the existing lease instead of creating duplicate infrastructure.
+
+### Concurrency Safety
+
+Lease and rate-limit state is protected with synchronization primitives to avoid inconsistent in-process state during concurrent requests.
+
+### Failure Handling
+
+The service distinguishes between:
+
+- Existing leases
+- Active provisioning
+- Pool exhaustion
+- Provisioning failures
+- Invalid requests
+- Rate-limit violations
+
+### Infrastructure Integration
+
+The API does not directly implement challenge provisioning logic. Instead, it integrates with the existing `icctl` and `lsctl` control-plane utilities.
+
+This keeps the self-service API separated from the underlying infrastructure implementation.
 
 ## Why It Was Built
 
-The system was developed to remove an operational bottleneck during a live CTF event.
+During a live CTF, infrastructure provisioning can become an operational bottleneck.
 
-Instead of:
+Manual allocation introduces several problems:
 
-```text
-Team → Organizer → CLI → Provision → Organizer → Team
-```
+- Organizer intervention for every request
+- Duplicate allocations
+- Slow response to players
+- Increased operational workload
+- Greater risk of inconsistent infrastructure state
 
-the workflow became:
+Lease Manager addresses this by exposing a controlled self-service provisioning layer over the existing infrastructure.
 
-```text
-Team → Lease Manager → Provision → Team
-```
-
-This reduced manual intervention while preserving the existing `icctl` and `lsctl` provisioning systems underneath.
+The result is a small control-plane service sitting between players and the infrastructure management utilities.
 
 ## BPCTF2 Context
 
-Lease Manager was deployed for the **Iron Cold** and **LightSpeed** challenge environments during BPCTF2.
+Lease Manager was deployed as part of BPCTF2 infrastructure to support challenge environments requiring per-team or leased infrastructure.
 
-The system was designed for a live event environment with a finite pool of isolated challenge resources and concurrent participant requests.
+The system was used during the live event to handle player provisioning requests and reduce manual infrastructure operations.
 
-It is intentionally preserved in this repository as the **BPCTF2 production implementation**.
-
-The architecture and assumptions here are specific to that deployment. A future generalized version will separate the provisioning control plane from the BPCTF-specific `icctl` / `lsctl` tooling and introduce persistent state, authentication, resource providers, quotas, lifecycle reconciliation, and additional infrastructure backends.
+It is preserved in this repository as the production/reference implementation from BPCTF2.
 
 ## Repository Structure
 
 ```text
-.
+lease-manager-bpctf2/
+│
 ├── lease-for-ironcold/
 │   ├── icctl
 │   ├── docker-compose.yml
@@ -284,11 +366,18 @@ The architecture and assumptions here are specific to that deployment. A future 
     ├── lease.html
     ├── lease-lightspeed.html
     ├── leased.service.template.txt
-    └── DEPLOY.md
+    ├── DEPLOY.md
+    └── README.md
 ```
 
 ## Status
 
-**Production deployment for BPCTF2.**
+This repository represents the BPCTF2 production implementation.
 
-This repository represents the event-specific implementation.
+It is preserved as a historical and technical reference rather than as the generalized version of the system.
+
+Future development of the concept should be implemented separately from this repository so that the original BPCTF2 deployment remains reproducible and traceable.
+
+## License
+
+No license has been specified for this repository.
